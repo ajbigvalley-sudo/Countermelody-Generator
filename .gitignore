@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+

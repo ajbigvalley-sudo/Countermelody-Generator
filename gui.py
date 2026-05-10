@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Drag-and-drop GUI for the countermelody generator.
 
-Run with:  python3 gui.py
+Run with:  python3 gui.py    (or double-click launch.bat on Windows)
 
 Drag a MIDI file onto the drop zone (or click to choose one), pick a
 style, and click Generate. The output appears next to the input file
-as <input>_with_counter.mid (or one file per style with --all variants).
+as <input>_with_counter.mid (or one file per style for "all variants").
 
-Drag-and-drop requires the optional 'tkinterdnd2' package. Without it,
-the file picker still works.
+Optional dependencies:
+    tkinterdnd2  - enables drag-and-drop
+    pygame       - enables in-app MIDI preview
 """
 
+import os
+import platform
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -20,8 +25,9 @@ try:
 except ImportError:
     raise SystemExit(
         "tkinter is required for the GUI.\n"
-        "  Debian/Ubuntu:  sudo apt install python3-tk\n"
-        "  macOS (Homebrew):  brew install python-tk"
+        "  Debian/Ubuntu:    sudo apt install python3-tk\n"
+        "  macOS (Homebrew): brew install python-tk\n"
+        "  Windows:          reinstall Python with the 'tcl/tk' option checked"
     )
 
 try:
@@ -32,29 +38,74 @@ except ImportError:
     BaseTk = tk.Tk
     HAS_DND = False
 
+try:
+    import pygame
+    pygame.mixer.init()
+    HAS_AUDIO = True
+except Exception:
+    HAS_AUDIO = False
+
 from countermelody import STYLES, CHORD_SOURCE_LABELS, generate_outputs
 
 
 SUPPORTED_EXTS = {".mid", ".midi"}
+ASSETS = Path(__file__).resolve().parent / "assets"
+ICON_ICO = ASSETS / "icon.ico"
+ICON_PNG = ASSETS / "icon.png"
+
+
+def reveal_in_file_manager(path: Path) -> None:
+    """Open the OS file manager pointed at the given file/folder."""
+    p = Path(path)
+    target = p if p.is_dir() else p.parent
+    system = platform.system()
+    if system == "Windows":
+        if p.is_file():
+            subprocess.run(["explorer", "/select,", str(p)])
+        else:
+            os.startfile(str(target))
+    elif system == "Darwin":
+        if p.is_file():
+            subprocess.run(["open", "-R", str(p)])
+        else:
+            subprocess.run(["open", str(target)])
+    else:
+        subprocess.run(["xdg-open", str(target)])
 
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title("Countermelody Generator")
-        root.geometry("600x500")
-        root.minsize(500, 460)
+        root.geometry("640x620")
+        root.minsize(540, 580)
+        self._set_icon()
 
         self.input_path = tk.StringVar()
         self.style_var = tk.StringVar(value="harmonic")
         self.all_var = tk.BooleanVar(value=False)
         self.place_var = tk.StringVar(value="auto")
 
+        self.last_outputs: list[Path] = []
+        self.preview_path: Path | None = None
+        self.is_playing = False
+
         self._build_drop_zone()
         self._build_style_picker()
         self._build_placement_picker()
         self._build_action_button()
         self._build_result_view()
+        self._build_post_action_bar()
+
+    def _set_icon(self):
+        try:
+            if platform.system() == "Windows" and ICON_ICO.exists():
+                self.root.iconbitmap(default=str(ICON_ICO))
+            elif ICON_PNG.exists():
+                self._icon_image = tk.PhotoImage(file=str(ICON_PNG))
+                self.root.iconphoto(True, self._icon_image)
+        except Exception:
+            pass
 
     def _build_drop_zone(self):
         intro = (
@@ -66,7 +117,7 @@ class App:
         self.drop = tk.Label(
             self.root, text=intro,
             relief="ridge", height=4, bg="#eef2f7", cursor="hand2",
-            wraplength=540, justify="center",
+            wraplength=580, justify="center",
         )
         self.drop.pack(fill="x", padx=20, pady=(15, 10))
         self.drop.bind("<Button-1>", lambda e: self.choose_file())
@@ -86,6 +137,7 @@ class App:
             self.root,
             text="Generate all 4 variants (one MIDI per style)",
             variable=self.all_var,
+            command=self._refresh_preview_menu,
         ).pack(anchor="w", padx=22, pady=2)
 
     def _build_placement_picker(self):
@@ -108,7 +160,39 @@ class App:
             self.root, height=8, wrap="word", state="disabled",
             bg="#f7f7f7", relief="flat", padx=8, pady=6,
         )
-        self.result.pack(fill="both", expand=True, padx=20, pady=(5, 15))
+        self.result.pack(fill="both", expand=True, padx=20, pady=(5, 5))
+
+    def _build_post_action_bar(self):
+        bar = ttk.Frame(self.root)
+        bar.pack(fill="x", padx=20, pady=(0, 15))
+
+        self.preview_var = tk.StringVar()
+        self.preview_menu = ttk.Combobox(
+            bar, textvariable=self.preview_var, state="disabled", width=24,
+        )
+        self.preview_menu.pack(side="left", padx=(0, 6))
+
+        self.play_btn = ttk.Button(
+            bar, text="Play preview", state="disabled", command=self.on_play,
+        )
+        self.play_btn.pack(side="left", padx=2)
+
+        self.stop_btn = ttk.Button(
+            bar, text="Stop", state="disabled", command=self.on_stop,
+        )
+        self.stop_btn.pack(side="left", padx=2)
+
+        self.open_btn = ttk.Button(
+            bar, text="Open output folder", state="disabled",
+            command=self.on_open_folder,
+        )
+        self.open_btn.pack(side="right")
+
+        if not HAS_AUDIO:
+            self._tooltip(
+                self.play_btn,
+                "Install pygame to enable preview:\n  pip install pygame",
+            )
 
     def _tooltip(self, widget, text):
         tip = {"win": None}
@@ -122,7 +206,7 @@ class App:
             tw.wm_overrideredirect(True)
             tw.wm_geometry(f"+{x}+{y}")
             tk.Label(tw, text=text, background="#ffffe0", relief="solid",
-                     borderwidth=1, padx=6, pady=2).pack()
+                     borderwidth=1, padx=6, pady=2, justify="left").pack()
             tip["win"] = tw
 
         def hide(_):
@@ -141,11 +225,9 @@ class App:
             self.set_input(path)
 
     def on_drop(self, event):
-        # tkdnd wraps paths containing spaces with curly braces
         raw = event.data.strip()
         if raw.startswith("{") and raw.endswith("}"):
             raw = raw[1:-1]
-        # Multi-file drops are space-separated; just take the first.
         first = raw.split("} {", 1)[0].strip("{}")
         self.set_input(first)
 
@@ -170,10 +252,75 @@ class App:
         self.result.insert("1.0", text)
         self.result.config(state="disabled")
 
+    def _refresh_preview_menu(self):
+        names = [p.name for p in self.last_outputs]
+        self.preview_menu["values"] = names
+        if names:
+            self.preview_menu.config(state="readonly")
+            self.preview_var.set(names[0])
+            if HAS_AUDIO:
+                self.play_btn.config(state="normal")
+            self.open_btn.config(state="normal")
+        else:
+            self.preview_menu.config(state="disabled")
+            self.play_btn.config(state="disabled")
+            self.stop_btn.config(state="disabled")
+            self.open_btn.config(state="disabled")
+
+    def _selected_output(self) -> Path | None:
+        name = self.preview_var.get()
+        for p in self.last_outputs:
+            if p.name == name:
+                return p
+        return self.last_outputs[0] if self.last_outputs else None
+
+    def on_play(self):
+        if not HAS_AUDIO:
+            messagebox.showinfo(
+                "Preview unavailable",
+                "Install pygame to enable preview:\n  pip install pygame",
+            )
+            return
+        target = self._selected_output()
+        if not target or not target.exists():
+            return
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.load(str(target))
+            pygame.mixer.music.play()
+            self.is_playing = True
+            self.stop_btn.config(state="normal")
+            self.play_btn.config(text="Restart")
+        except Exception as exc:
+            messagebox.showerror(
+                "Playback error",
+                f"Couldn't play this MIDI file:\n{exc}\n\n"
+                "On some systems pygame needs a soundfont or a system MIDI synth "
+                "to render MIDI. The file itself is fine - try opening it in a "
+                "DAW or a player like MuseScore.",
+            )
+
+    def on_stop(self):
+        if HAS_AUDIO:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+        self.is_playing = False
+        self.stop_btn.config(state="disabled")
+        self.play_btn.config(text="Play preview")
+
+    def on_open_folder(self):
+        target = self._selected_output()
+        if target:
+            reveal_in_file_manager(target)
+
     def on_generate(self):
         if not self.input_path.get():
             messagebox.showwarning("No file", "Choose a melody file first.")
             return
+
+        self.on_stop()
 
         in_p = Path(self.input_path.get())
         styles = list(STYLES) if self.all_var.get() else [self.style_var.get()]
@@ -214,9 +361,14 @@ class App:
             for p in result["outputs"]:
                 lines.append(f"  {p}")
             text = "\n".join(lines)
-            self.root.after(0, lambda: self.set_result(text))
-            self.root.after(0, lambda: self.btn.config(
-                state="normal", text="Generate Countermelody"))
+
+            def finish():
+                self.set_result(text)
+                self.last_outputs = [Path(p) for p in result["outputs"]]
+                self._refresh_preview_menu()
+                self.btn.config(state="normal", text="Generate Countermelody")
+
+            self.root.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
