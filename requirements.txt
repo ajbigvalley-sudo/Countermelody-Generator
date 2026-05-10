@@ -1,1 +1,5 @@
 music21>=9.1.0
+
+# Optional: enables drag-and-drop in gui.py.
+# Without it the GUI still works via the file picker.
+# tkinterdnd2>=0.4.0

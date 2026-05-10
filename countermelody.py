@@ -421,6 +421,52 @@ def output_path_for_style(base: Path, style_name: str) -> Path:
     return base.with_name(f"{base.stem}_{style_name}{base.suffix}")
 
 
+CHORD_SOURCE_LABELS = {
+    "read": "read from input",
+    "inferred": "inferred from melody",
+    "none": "(no chord context)",
+}
+
+
+def generate_outputs(input_path, output_path, style_names,
+                     place_below=None, on_progress=None):
+    """High-level entry point shared by CLI and GUI.
+
+    Returns dict with: detected_key (str), chord_source (str), outputs (list[Path]).
+    on_progress: optional callable(style_name, out_path) called after each file.
+    """
+    in_path = Path(input_path)
+    base_out = Path(output_path)
+
+    score = converter.parse(str(in_path))
+    detected_key = detect_key(score)
+
+    written = []
+    chord_source = "none"
+    multi = len(style_names) > 1
+
+    for name in style_names:
+        style = STYLES[name]
+        counter, src = generate_countermelody(
+            score, detected_key, style, place_below=place_below,
+        )
+        if chord_source == "none":
+            chord_source = src
+        out = build_output_score(score, counter)
+        out_path = output_path_for_style(base_out, name) if multi else base_out
+        out.makeNotation(inPlace=True)
+        out.write("midi", fp=str(out_path))
+        written.append(out_path)
+        if on_progress:
+            on_progress(name, out_path)
+
+    return {
+        "detected_key": str(detected_key),
+        "chord_source": chord_source,
+        "outputs": written,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate countermelodies in the same key as the input melody.",
@@ -465,32 +511,17 @@ def main(argv=None):
     elif args.below:
         place_below = True
 
-    score = converter.parse(str(in_path))
-    detected_key = detect_key(score)
-    print(f"Detected key: {detected_key}")
-
-    base_out = Path(args.output)
     style_names = list(STYLES) if args.all_variants else [args.style]
 
-    chord_source_label = {"read": "read from input", "inferred": "inferred from melody",
-                          "none": "(no chord context)"}
-    first = True
-    for style_name in style_names:
-        style = STYLES[style_name]
-        counter, chord_source = generate_countermelody(
-            score, detected_key, style, place_below=place_below
-        )
-        if first:
-            print(f"Chord context: {chord_source_label.get(chord_source, chord_source)}")
-            first = False
-        output = build_output_score(score, counter)
-        out_path = (
-            output_path_for_style(base_out, style_name)
-            if args.all_variants else base_out
-        )
-        output.makeNotation(inPlace=True)
-        output.write("midi", fp=str(out_path))
-        print(f"  [{style_name:<12}] {out_path}")
+    def on_progress(name, out_path):
+        print(f"  [{name:<12}] {out_path}")
+
+    result = generate_outputs(
+        in_path, args.output, style_names,
+        place_below=place_below, on_progress=on_progress,
+    )
+    print(f"Detected key: {result['detected_key']}")
+    print(f"Chord context: {CHORD_SOURCE_LABELS.get(result['chord_source'], result['chord_source'])}")
 
 
 if __name__ == "__main__":
